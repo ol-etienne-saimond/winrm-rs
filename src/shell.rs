@@ -241,15 +241,24 @@ impl<'a> Shell<'a> {
     /// Send Ctrl+C signal to a running command.
     ///
     /// Requests graceful interruption of the command identified by `command_id`.
+    /// On a PSRP shell (see [`WinrmClient::open_psrp_shell`]) this stops the
+    /// pipeline whose id is `command_id` and leaves the runspace open.
     pub async fn signal_ctrl_c(&self, command_id: &str) -> Result<(), WinrmError> {
         let endpoint = self.client.endpoint(&self.host);
         let config = self.client.config();
-        let envelope = soap::signal_ctrl_c_request(
+        let code = if self.resource_uri.contains("powershell") {
+            soap::namespaces::SIGNAL_PS_CTRL_C
+        } else {
+            soap::namespaces::SIGNAL_CTRL_C
+        };
+        let envelope = soap::signal_request_with_uri(
             &endpoint,
             &self.shell_id,
             command_id,
+            code,
             config.operation_timeout_secs,
             config.max_envelope_size,
+            &self.resource_uri,
         );
         self.client.send_soap_raw(&self.host, envelope).await?;
         Ok(())

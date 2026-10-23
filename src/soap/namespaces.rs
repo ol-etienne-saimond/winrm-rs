@@ -44,6 +44,10 @@ pub(crate) const SIGNAL_TERMINATE: &str =
 pub(crate) const SIGNAL_CTRL_C: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/ctrl_c";
 
+/// Signal code that stops a PSRP pipeline (MS-PSRP 3.1.4.12). `crtl` is the
+/// protocol's own spelling: the server rejects `ctrl`.
+pub(crate) const SIGNAL_PS_CTRL_C: &str = "powershell/signal/crtl_c";
+
 /// Command state indicating completion.
 pub(crate) const COMMAND_STATE_DONE: &str =
     "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandState/Done";

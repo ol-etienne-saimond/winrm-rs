@@ -719,7 +719,9 @@ pub(crate) fn send_psrp_request(
 /// Build a WS-Management Signal (Ctrl+C) SOAP envelope.
 ///
 /// Sends a Ctrl+C signal to the command identified by `command_id` within
-/// `shell_id`, requesting graceful interruption.
+/// `shell_id`, requesting graceful interruption. For a cmd shell; see
+/// [`signal_request_with_uri`] for any other.
+#[cfg(test)]
 pub(crate) fn signal_ctrl_c_request(
     endpoint: &str,
     shell_id: &str,
@@ -727,20 +729,46 @@ pub(crate) fn signal_ctrl_c_request(
     timeout_secs: u64,
     max_envelope_size: u32,
 ) -> String {
-    let header = build_header(
+    signal_request_with_uri(
+        endpoint,
+        shell_id,
+        command_id,
+        SIGNAL_CTRL_C,
+        timeout_secs,
+        max_envelope_size,
+        RESOURCE_URI_CMD,
+    )
+}
+
+/// Build a Signal envelope with `code` for a shell of `resource_uri`. A
+/// PSRP shell has to be addressed with its own resource URI (the cmd one
+/// gets `w:InvalidSelectors`, "the shell was not found") and takes its own
+/// signal codes.
+pub(crate) fn signal_request_with_uri(
+    endpoint: &str,
+    shell_id: &str,
+    command_id: &str,
+    code: &str,
+    timeout_secs: u64,
+    max_envelope_size: u32,
+    resource_uri: &str,
+) -> String {
+    let header = build_header_for(
         endpoint,
         ACTION_SIGNAL,
+        resource_uri,
         Some(shell_id),
         timeout_secs,
         max_envelope_size,
     );
     let escaped_command_id = xml_escape(command_id);
+    let escaped_code = xml_escape(code);
     format!(
         r#"<s:Envelope {NS_DECL_WITH_RSP}>
 {header}
   <s:Body>
     <rsp:Signal CommandId="{escaped_command_id}">
-      <rsp:Code>{SIGNAL_CTRL_C}</rsp:Code>
+      <rsp:Code>{escaped_code}</rsp:Code>
     </rsp:Signal>
   </s:Body>
 </s:Envelope>"#
@@ -1041,6 +1069,29 @@ mod tests {
         assert!(xml.contains("C1"));
         assert!(xml.contains("signal/ctrl_c"));
         assert!(xml.contains("153600"));
+    }
+
+    #[test]
+    fn signal_ctrl_c_targets_the_cmd_resource() {
+        let xml = signal_ctrl_c_request("http://host:5985/wsman", "S1", "C1", 60, 153_600);
+        assert!(xml.contains(RESOURCE_URI_CMD));
+    }
+
+    #[test]
+    fn psrp_signal_targets_the_psrp_resource_with_the_ps_code() {
+        let xml = signal_request_with_uri(
+            "http://host:5985/wsman",
+            "S1",
+            "C1",
+            crate::soap::namespaces::SIGNAL_PS_CTRL_C,
+            60,
+            153_600,
+            crate::soap::namespaces::RESOURCE_URI_PSRP,
+        );
+        assert!(xml.contains(crate::soap::namespaces::RESOURCE_URI_PSRP));
+        assert!(!xml.contains(RESOURCE_URI_CMD));
+        assert!(xml.contains("<rsp:Code>powershell/signal/crtl_c</rsp:Code>"));
+        assert!(xml.contains(r#"<rsp:Signal CommandId="C1">"#));
     }
 
     #[test]
