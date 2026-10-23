@@ -120,6 +120,25 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
+    /// Pin `host` to the end-entity certificate whose SHA-256 is `sha256`:
+    /// a TLS handshake with `host` presenting any other certificate fails
+    /// before anything is sent on that connection, credentials included.
+    /// Other hosts are not affected. `host` is matched against the host
+    /// passed to each call (IP literals in any notation, names
+    /// case-insensitively).
+    ///
+    /// Meant for [`WinrmConfig::accept_invalid_certs`] setups, where nothing
+    /// else ties a host to its certificate: pin on first use with
+    /// [`WinrmClient::server_cert_sha256`]. Pinning again for the same host
+    /// replaces the pin.
+    #[must_use]
+    pub fn pin_server_cert(mut self, host: &str, sha256: [u8; 32]) -> Self {
+        self.options
+            .cert_pins
+            .insert(crate::tls::host_key(host), sha256);
+        self
+    }
+
     /// Build the [`WinrmClient`].
     ///
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
@@ -167,6 +186,20 @@ mod tests {
             .build()
             .unwrap();
         assert!(opted_out.transport.options().no_env_proxy);
+    }
+
+    #[test]
+    fn pin_server_cert_reaches_the_transport_keyed_like_the_handshake() {
+        let client = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(WinrmCredentials::new("admin", "pass", ""))
+            .pin_server_cert("Win01.Corp", [7; 32])
+            .build()
+            .unwrap();
+        assert_eq!(
+            client.transport.options().cert_pins.get("win01.corp"),
+            Some(&[7; 32])
+        );
+        assert_eq!(client.server_cert_sha256("win01.corp"), None);
     }
 
     #[test]

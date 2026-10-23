@@ -59,6 +59,19 @@ impl WinrmClient {
         })
     }
 
+    /// SHA-256 of the end-entity certificate `host` presented in this
+    /// client's last TLS handshake with it, accepted or not; `None` before
+    /// any HTTPS request to `host`.
+    ///
+    /// For pinning on first use: after a first successful call, store it and
+    /// pass it to [`WinrmClientBuilder::pin_server_cert`](crate::WinrmClientBuilder::pin_server_cert)
+    /// next time. When a pinned client fails, a value here that differs from
+    /// the pin means the host presented another certificate.
+    #[must_use]
+    pub fn server_cert_sha256(&self, host: &str) -> Option<[u8; 32]> {
+        self.transport.server_cert_sha256(host)
+    }
+
     /// Build the WinRM endpoint URL for a given host.
     pub(crate) fn endpoint(&self, host: &str) -> String {
         self.transport.endpoint(host)

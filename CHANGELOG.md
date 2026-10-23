@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   to the WinRM host directly, unless `WinrmConfig::proxy` names a proxy. By
   default the client honours them, which with `accept_invalid_certs` puts
   any proxy the environment names in the middle of every exchange.
+- **`WinrmClientBuilder::pin_server_cert` and
+  `WinrmClient::server_cert_sha256`**: pin a host to the SHA-256 of its
+  end-entity certificate, so a handshake presenting another one fails
+  before anything (credentials included) is sent; and read the certificate
+  a host last presented, to pin on first use or to tell a mismatch apart
+  from other failures. Meant for `accept_invalid_certs` setups, where a
+  man-in-the-middle with its own certificate can otherwise capture the
+  NTLMv2 response.
 
 ## [1.4.0] - 2026-10-22
 

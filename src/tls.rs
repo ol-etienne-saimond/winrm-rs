@@ -6,6 +6,7 @@
 // server certificate hash is injected into the NTLM Type 3 message to bind
 // authentication to the TLS channel, preventing relay attacks.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -277,6 +278,103 @@ impl CertHandle {
             pinned: Arc::new(Mutex::new(None)),
             has_target: true,
         }
+    }
+}
+
+/// The key [`PinningVerifier`] files a host under: an IP literal in its
+/// canonical form (brackets dropped), a name lowercased, so that the host a
+/// caller pins and the TLS server name the handshake reports match.
+pub(crate) fn host_key(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.to_string(),
+        Err(_) => bare.to_ascii_lowercase(),
+    }
+}
+
+/// SHA-256 of a DER certificate.
+pub(crate) fn cert_sha256(cert: &CertificateDer<'_>) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(cert.as_ref()).into()
+}
+
+/// SHA-256 of the certificate each host last presented, keyed by [`host_key`].
+pub(crate) type SeenCerts = Arc<Mutex<HashMap<String, [u8; 32]>>>;
+
+/// Wraps the transport's verifier: refuses a host whose end-entity
+/// certificate differs from the SHA-256 pinned for it
+/// (`WinrmClientBuilder::pin_server_cert`), before anything is sent on the
+/// connection, and records the certificate each host presented
+/// (`WinrmClient::server_cert_sha256`), accepted or not, so a caller can
+/// pin it on first use or tell a mismatch apart from other failures.
+#[derive(Debug)]
+pub(crate) struct PinningVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    pins: HashMap<String, [u8; 32]>,
+    seen: SeenCerts,
+}
+
+impl PinningVerifier {
+    /// `pins` and `seen` are keyed by [`host_key`].
+    pub(crate) fn new(
+        inner: Arc<dyn ServerCertVerifier>,
+        pins: HashMap<String, [u8; 32]>,
+        seen: SeenCerts,
+    ) -> Self {
+        Self { inner, pins, seen }
+    }
+}
+
+impl ServerCertVerifier for PinningVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        let key = host_key(&server_name.to_str());
+        let fingerprint = cert_sha256(end_entity);
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone(), fingerprint);
+        if let Some(pin) = self.pins.get(&key)
+            && *pin != fingerprint
+        {
+            return Err(PinMismatch::refuse(
+                "server certificate differs from the one pinned for this host \
+                 (WinrmClientBuilder::pin_server_cert); refusing the handshake",
+            ));
+        }
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -751,6 +849,72 @@ mod tests {
         let _ = verifier.verify_server_cert(&fake_cert, &[], &server_name, &[], UnixTime::now());
 
         assert_eq!(handle1.captured(), handle2.captured());
+    }
+
+    #[test]
+    fn host_key_canonicalises_ips_and_lowercases_names() {
+        assert_eq!(host_key("10.0.0.1"), "10.0.0.1");
+        assert_eq!(host_key("[::1]"), "::1");
+        assert_eq!(host_key("0:0:0:0:0:0:0:1"), "::1");
+        assert_eq!(host_key("Win01.Corp.Local"), "win01.corp.local");
+    }
+
+    fn pinning(pins: &[(&str, [u8; 32])]) -> (PinningVerifier, SeenCerts) {
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        let pins = pins.iter().map(|(h, p)| (host_key(h), *p)).collect();
+        (
+            PinningVerifier::new(Arc::new(NoVerifier), pins, Arc::clone(&seen)),
+            seen,
+        )
+    }
+
+    #[test]
+    fn pinning_verifier_accepts_the_pinned_certificate_and_records_it() {
+        let cert = CertificateDer::from(vec![0x30, 1, 2, 3]);
+        let (verifier, seen) = pinning(&[("10.0.0.1", cert_sha256(&cert))]);
+        let name = ServerName::try_from("10.0.0.1").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        );
+        assert_eq!(
+            seen.lock().unwrap().get("10.0.0.1"),
+            Some(&cert_sha256(&cert))
+        );
+    }
+
+    #[test]
+    fn pinning_verifier_refuses_another_certificate_but_still_records_it() {
+        let pinned = CertificateDer::from(vec![0x30, 1, 2, 3]);
+        let other = CertificateDer::from(vec![0x30, 9, 9, 9]);
+        let (verifier, seen) = pinning(&[("10.0.0.1", cert_sha256(&pinned))]);
+        let name = ServerName::try_from("10.0.0.1").unwrap();
+        let err = verifier
+            .verify_server_cert(&other, &[], &name, &[], UnixTime::now())
+            .unwrap_err();
+        assert!(is_pin_mismatch(&err), "{err:?}");
+        assert_eq!(
+            seen.lock().unwrap().get("10.0.0.1"),
+            Some(&cert_sha256(&other))
+        );
+    }
+
+    #[test]
+    fn pinning_verifier_leaves_unpinned_hosts_to_the_inner_verifier() {
+        let pinned = CertificateDer::from(vec![0x30, 1, 2, 3]);
+        let other = CertificateDer::from(vec![0x30, 9, 9, 9]);
+        let (verifier, seen) = pinning(&[("10.0.0.1", cert_sha256(&pinned))]);
+        let name = ServerName::try_from("10.0.0.2").unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&other, &[], &name, &[], UnixTime::now())
+                .is_ok()
+        );
+        assert_eq!(
+            seen.lock().unwrap().get("10.0.0.2"),
+            Some(&cert_sha256(&other))
+        );
     }
 
     #[test]

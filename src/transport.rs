@@ -228,12 +228,18 @@ pub(crate) struct TransportOptions {
     /// `ALL_PROXY` and their lowercase forms). An explicit
     /// [`WinrmConfig::proxy`] is still used.
     pub(crate) no_env_proxy: bool,
+    /// SHA-256 of the end-entity certificate each host must present, keyed
+    /// by [`crate::tls::host_key`].
+    pub(crate) cert_pins: std::collections::HashMap<String, [u8; 32]>,
 }
 
 pub(crate) struct HttpTransport {
     http: reqwest::Client,
     config: WinrmConfig,
     options: TransportOptions,
+    /// SHA-256 of the certificate each host last presented, keyed by
+    /// [`crate::tls::host_key`] (see [`crate::tls::PinningVerifier`]).
+    server_certs: crate::tls::SeenCerts,
     credentials: WinrmCredentials,
     /// rustls configuration of [`Self::http`] and its server certificate
     /// verifier (HTTPS only), the base of the dedicated clients.
@@ -556,6 +562,7 @@ impl HttpTransport {
         // NTLM channel binding takes the server certificate of the connection
         // that carried the challenge: from the response (`tls_info`), or from
         // the verifier of a dedicated single-connection client (see `AuthConn`).
+        let server_certs = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let tls_config = if config.use_tls {
             let root_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -567,6 +574,12 @@ impl HttpTransport {
                         .build()
                         .map_err(|e| WinrmError::AuthFailed(format!("TLS verifier error: {e}")))?
                 };
+            let inner_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
+                Arc::new(crate::tls::PinningVerifier::new(
+                    inner_verifier,
+                    options.cert_pins.clone(),
+                    Arc::clone(&server_certs),
+                ));
             let tls_builder = rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::clone(&inner_verifier));
@@ -594,6 +607,7 @@ impl HttpTransport {
             http,
             config,
             options,
+            server_certs,
             credentials,
             tls_config,
             conn_pool: Mutex::new(Vec::new()),
@@ -606,6 +620,16 @@ impl HttpTransport {
     #[cfg(test)]
     pub(crate) fn options(&self) -> &TransportOptions {
         &self.options
+    }
+
+    /// SHA-256 of the end-entity certificate `host` last presented in a TLS
+    /// handshake, accepted or not.
+    pub(crate) fn server_cert_sha256(&self, host: &str) -> Option<[u8; 32]> {
+        self.server_certs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&crate::tls::host_key(&sanitize_host(host)))
+            .copied()
     }
 
     /// Install the gate checked before every request attempt.
@@ -3144,6 +3168,67 @@ mod tests {
             Some(cbt_of(RSA_CERT_PEM)),
             "host B"
         );
+    }
+
+    /// A pinned host presenting another certificate fails before anything
+    /// is sent (no Type 1, so no credentials), and the certificate it
+    /// presented is still reported; the right pin works as usual.
+    #[tokio::test]
+    async fn pinned_host_with_another_certificate_fails_before_sending() {
+        use crate::test_pki::{EC_CERT_PEM, EC_KEY_PKCS8_PEM, RSA_CERT_PEM};
+        use rustls::pki_types::CertificateDer;
+        use rustls::pki_types::pem::PemObject;
+        let fingerprint = |pem: &str| {
+            crate::tls::cert_sha256(&CertificateDer::from_pem_slice(pem.as_bytes()).unwrap())
+        };
+        let (port, seen) = spawn_ntlm_tls_server(EC_CERT_PEM, EC_KEY_PKCS8_PEM);
+        let proxy = spawn_connect_proxy();
+        let pinned_transport = |pin: [u8; 32]| {
+            let config = WinrmConfig {
+                auth_method: AuthMethod::Ntlm,
+                use_tls: true,
+                accept_invalid_certs: true,
+                port,
+                proxy: Some(format!("http://127.0.0.1:{proxy}")),
+                connect_timeout_secs: 5,
+                operation_timeout_secs: 5,
+                ..Default::default()
+            };
+            let mut options = TransportOptions::default();
+            options
+                .cert_pins
+                .insert(crate::tls::host_key("127.0.0.1"), pin);
+            HttpTransport::with_options(config, WinrmCredentials::new(USER, PASS, ""), options)
+                .unwrap()
+        };
+        let url = format!("https://127.0.0.1:{port}/wsman");
+
+        let wrong = pinned_transport(fingerprint(RSA_CERT_PEM));
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            wrong.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+        )
+        .await
+        .expect("did not finish in 20 s");
+        assert!(result.is_err(), "a mismatched pin must fail");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may reach the server"
+        );
+        assert_eq!(
+            wrong.server_cert_sha256("127.0.0.1"),
+            Some(fingerprint(EC_CERT_PEM))
+        );
+
+        let right = pinned_transport(fingerprint(EC_CERT_PEM));
+        let reply = tokio::time::timeout(
+            Duration::from_secs(20),
+            right.send_ntlm_over_tls("127.0.0.1", &url, "<soap/>"),
+        )
+        .await
+        .expect("did not finish in 20 s")
+        .unwrap();
+        assert_eq!(reply, "<ok/>");
     }
 
     /// Over TLS, a handshake whose connection reports no server certificate
