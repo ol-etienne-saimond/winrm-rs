@@ -41,8 +41,21 @@ impl WinrmClient {
     /// constructed (e.g. invalid TLS configuration).
     #[tracing::instrument(level = "debug", skip(config, credentials))]
     pub fn new(config: WinrmConfig, credentials: WinrmCredentials) -> Result<Self, WinrmError> {
+        Self::with_options(
+            config,
+            credentials,
+            crate::transport::TransportOptions::default(),
+        )
+    }
+
+    /// [`Self::new`] with options only the builder sets.
+    pub(crate) fn with_options(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        options: crate::transport::TransportOptions,
+    ) -> Result<Self, WinrmError> {
         Ok(Self {
-            transport: HttpTransport::new(config, credentials)?,
+            transport: HttpTransport::with_options(config, credentials, options)?,
         })
     }
 

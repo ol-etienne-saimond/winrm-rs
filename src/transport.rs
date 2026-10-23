@@ -219,9 +219,21 @@ pub(crate) type BeforeSend = Arc<dyn Fn() -> bool + Send + Sync>;
 /// HTTP transport for WinRM SOAP requests.
 ///
 /// Handles authentication dispatch, retry logic, and endpoint construction.
+/// Client options set through [`crate::WinrmClientBuilder`] rather than
+/// [`WinrmConfig`]: a new public field there would break callers that build
+/// it with a struct literal.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TransportOptions {
+    /// Ignore proxies from the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY` and their lowercase forms). An explicit
+    /// [`WinrmConfig::proxy`] is still used.
+    pub(crate) no_env_proxy: bool,
+}
+
 pub(crate) struct HttpTransport {
     http: reqwest::Client,
     config: WinrmConfig,
+    options: TransportOptions,
     credentials: WinrmCredentials,
     /// rustls configuration of [`Self::http`] and its server certificate
     /// verifier (HTTPS only), the base of the dedicated clients.
@@ -420,6 +432,7 @@ pub(crate) fn validate_host(host: &str) -> Result<(), WinrmError> {
 /// stay on the authenticated connection.
 fn build_http_client(
     config: &WinrmConfig,
+    options: &TransportOptions,
     tls_config: Option<rustls::ClientConfig>,
     max_idle_per_host: usize,
 ) -> Result<reqwest::Client, WinrmError> {
@@ -448,10 +461,11 @@ fn build_http_client(
     if let Some(ref proxy_url) = config.proxy {
         let proxy = reqwest::Proxy::all(proxy_url).map_err(WinrmError::Http)?;
         builder = builder.proxy(proxy);
-    } else if cfg!(test) {
+    } else if cfg!(test) || options.no_env_proxy {
         // Unit tests talk to loopback servers: keep `HTTP(S)_PROXY` from the
         // environment out of them. Builds outside tests keep reqwest's
-        // system-proxy behaviour.
+        // system-proxy behaviour unless the caller opted out
+        // (`WinrmClientBuilder::no_env_proxy`).
         builder = builder.no_proxy();
     }
     if let Some(tls_config) = tls_config {
@@ -466,10 +480,20 @@ impl HttpTransport {
     /// Builds the underlying HTTP client with the configured timeouts and TLS
     /// settings. Returns [`WinrmError::Http`] if the HTTP client cannot be
     /// constructed (e.g. invalid TLS configuration).
-    #[tracing::instrument(level = "debug", skip(config, credentials))]
+    #[cfg(test)]
     pub(crate) fn new(
         config: WinrmConfig,
         credentials: WinrmCredentials,
+    ) -> Result<Self, WinrmError> {
+        Self::with_options(config, credentials, TransportOptions::default())
+    }
+
+    /// [`Self::new`] with the builder's [`TransportOptions`].
+    #[tracing::instrument(level = "debug", skip(config, credentials))]
+    pub(crate) fn with_options(
+        config: WinrmConfig,
+        credentials: WinrmCredentials,
+        options: TransportOptions,
     ) -> Result<Self, WinrmError> {
         if config.accept_invalid_certs {
             tracing::warn!(
@@ -559,11 +583,17 @@ impl HttpTransport {
             None
         };
 
-        let http = build_http_client(&config, tls_config.as_ref().map(|(c, _)| c.clone()), 10)?;
+        let http = build_http_client(
+            &config,
+            &options,
+            tls_config.as_ref().map(|(c, _)| c.clone()),
+            10,
+        )?;
 
         Ok(Self {
             http,
             config,
+            options,
             credentials,
             tls_config,
             conn_pool: Mutex::new(Vec::new()),
@@ -571,6 +601,11 @@ impl HttpTransport {
             session_id: format!("uuid:{}", uuid::Uuid::new_v4().to_string().to_uppercase()),
             before_send: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn options(&self) -> &TransportOptions {
+        &self.options
     }
 
     /// Install the gate checked before every request attempt.
@@ -820,8 +855,9 @@ impl HttpTransport {
                     url_server_name(&self.endpoint(host)),
                 )
                 .with_proxies(proxy_server_names(&self.config, |name| {
-                    // Tests build their clients without environment proxies.
-                    if cfg!(test) {
+                    // Tests build their clients without environment proxies,
+                    // and so does a caller that opted out.
+                    if cfg!(test) || self.options.no_env_proxy {
                         None
                     } else {
                         std::env::var(name).ok()
@@ -839,7 +875,7 @@ impl HttpTransport {
         };
         Ok(Box::new(AuthConn {
             host: host.to_string(),
-            http: build_http_client(&self.config, tls, 1)?,
+            http: build_http_client(&self.config, &self.options, tls, 1)?,
             cert,
             session: None,
             idle_since: Instant::now(),

@@ -33,6 +33,7 @@ pub struct WinrmClientBuilder<S = NeedsCredentials> {
     // `AssertUnwindSafe` keeps the builder `UnwindSafe` and `RefUnwindSafe`
     // as it was before the hook existed; the hook is never called here.
     before_send: Option<AssertUnwindSafe<crate::transport::BeforeSend>>,
+    options: crate::transport::TransportOptions,
     _state: std::marker::PhantomData<S>,
 }
 
@@ -43,6 +44,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             config,
             credentials: None,
             before_send: None,
+            options: crate::transport::TransportOptions::default(),
             _state: std::marker::PhantomData,
         }
     }
@@ -53,6 +55,7 @@ impl WinrmClientBuilder<NeedsCredentials> {
             config: self.config,
             credentials: Some(creds),
             before_send: self.before_send,
+            options: self.options,
             _state: std::marker::PhantomData,
         }
     }
@@ -93,6 +96,30 @@ impl WinrmClientBuilder<Ready> {
         self
     }
 
+    /// Ignore proxies set in the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
+    /// `ALL_PROXY`, their lowercase forms, and `NO_PROXY`): connect to the
+    /// WinRM host directly unless [`WinrmConfig::proxy`] names a proxy.
+    ///
+    /// By default the client honours them, like any reqwest client. With
+    /// `accept_invalid_certs` that lets whatever proxy the environment names
+    /// sit in the middle of every WinRM exchange without the client noticing.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use winrm_rs::{WinrmClient, WinrmConfig, WinrmCredentials};
+    ///
+    /// let client = WinrmClient::builder(WinrmConfig::default())
+    ///     .credentials(WinrmCredentials::new("admin", "pass", ""))
+    ///     .no_env_proxy()
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn no_env_proxy(mut self) -> Self {
+        self.options.no_env_proxy = true;
+        self
+    }
+
     /// Build the [`WinrmClient`].
     ///
     /// Returns [`WinrmError::Http`] if the underlying HTTP client cannot be
@@ -100,10 +127,11 @@ impl WinrmClientBuilder<Ready> {
     pub fn build(self) -> Result<WinrmClient, WinrmError> {
         // SAFETY: The typestate pattern guarantees that `credentials` is
         // `Some` when `build()` is callable (state = Ready).
-        let mut client = WinrmClient::new(
+        let mut client = WinrmClient::with_options(
             self.config,
             self.credentials
                 .expect("typestate guarantees credentials are set"),
+            self.options,
         )?;
         if let Some(hook) = self.before_send {
             client.transport.set_before_send(hook.0);
@@ -123,6 +151,22 @@ mod tests {
         fn assert_unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
         assert_unwind_safe::<WinrmClientBuilder<NeedsCredentials>>();
         assert_unwind_safe::<WinrmClientBuilder<Ready>>();
+    }
+
+    #[test]
+    fn no_env_proxy_reaches_the_transport() {
+        let creds = || WinrmCredentials::new("admin", "pass", "");
+        let default = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(creds())
+            .build()
+            .unwrap();
+        assert!(!default.transport.options().no_env_proxy);
+        let opted_out = WinrmClientBuilder::new(WinrmConfig::default())
+            .credentials(creds())
+            .no_env_proxy()
+            .build()
+            .unwrap();
+        assert!(opted_out.transport.options().no_env_proxy);
     }
 
     #[test]

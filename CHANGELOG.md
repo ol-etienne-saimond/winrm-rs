@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`WinrmClientBuilder::no_env_proxy`**: ignore `HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY` (and their lowercase forms) from the environment and connect
+  to the WinRM host directly, unless `WinrmConfig::proxy` names a proxy. By
+  default the client honours them, which with `accept_invalid_certs` puts
+  any proxy the environment names in the middle of every exchange.
+
 ## [1.4.0] - 2026-10-22
 
 Adds a hook to meter or refuse each request before it is sent.
